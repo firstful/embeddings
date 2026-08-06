@@ -35,12 +35,16 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 DB_PATH = DATA_DIR / "vectors.db"
 DOCS_URL = os.environ.get("DOCS_URL", "http://192.168.1.2:3000/reeds/homelab-docs.git")
 DOCS_TOKEN = os.environ.get("DOCS_TOKEN", "")
+SOURCES_DIR = Path(os.environ.get("SOURCES_DIR", "/sources"))
+SKILLS_DIR = SOURCES_DIR / "skills"
+SESSION_DB = SOURCES_DIR / "hermes-state.db"
+SESSION_CONSUMER = os.environ.get("SESSION_CONSUMER", "hermes-rook")
 TOP_K_DEFAULT = int(os.environ.get("TOP_K_DEFAULT", "5"))
 MIN_SCORE = float(os.environ.get("MIN_SCORE", "0.15"))
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title=APP_NAME, version="1.1.0")
+app = FastAPI(title=APP_NAME, version="1.2.0")
 
 _model = None
 
@@ -367,9 +371,186 @@ async def _refresh_docs():
     return {"status": "ok", "source": "docs", "indexed": len(chunks)}
 
 
+def _split_markdown_para(text: str, min_chars: int = 150, max_chars: int = 1800) -> list[str]:
+    """Split markdown by headings then paragraph boundaries (skills + session text)."""
+    sections = re.split(r"(?m)^(#{1,4}\s)", text)
+    chunks = []
+    buf = ""
+    for part in sections:
+        if re.match(r"^#{1,4}\s$", part):
+            if buf.strip():
+                chunks.append(buf.strip())
+            buf = part
+        else:
+            buf += part
+            if len(buf) >= min_chars:
+                if len(buf) >= max_chars:
+                    cut = buf.rfind("\n\n", 0, max_chars)
+                    if cut > min_chars:
+                        chunks.append(buf[:cut].strip())
+                        buf = buf[cut:]
+    if buf.strip():
+        chunks.append(buf.strip())
+    return [c for c in chunks if len(c) >= 80]
+
+
+def _session_chunks(db_path: Path, consumer: str, chunk_chars: int = 1500) -> list[dict]:
+    """Read the state.db snapshot and chunk conversations per session (same logic as
+    the old host exporter: role: content lines, ~1500-char windows)."""
+    import sqlite3 as _sq
+
+    conn = _sq.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.row_factory = _sq.Row
+    sessions = {}
+    try:
+        for r in conn.execute("SELECT id, title, started_at, source FROM sessions"):
+            sessions[r["id"]] = {"title": r["title"] or r["id"], "started_at": r["started_at"], "source": r["source"] or ""}
+    except _sq.Error:
+        pass
+    rows = conn.execute(
+        "SELECT id, session_id, role, content, timestamp FROM messages ORDER BY id"
+    ).fetchall()
+    conn.close()
+
+    by_session: dict[str, list[dict]] = {}
+    for r in rows:
+        by_session.setdefault(r["session_id"], []).append(
+            {"id": r["id"], "role": r["role"], "content": r["content"], "timestamp": r["timestamp"]}
+        )
+
+    out: list[dict] = []
+    for sid, msgs in by_session.items():
+        meta = sessions.get(sid, {})
+        buf: list[str] = []
+        buf_len = 0
+        idx = 0
+        for m in msgs:
+            content = m.get("content") or ""
+            line = f"{m.get('role', 'user')}: {content}".strip()
+            if not line:
+                continue
+            line += "\n"
+            if buf and buf_len + len(line) > chunk_chars:
+                text = "".join(buf).strip()
+                if len(text) >= 60:
+                    out.append({
+                        "id": f"session:{sid}:{idx}",
+                        "title": meta.get("title") or sid,
+                        "text": text,
+                        "meta": {"session_id": sid, "session_title": meta.get("title") or "", "source_type": meta.get("source") or "", "started_at": meta.get("started_at")},
+                    })
+                    idx += 1
+                buf = []
+                buf_len = 0
+            buf.append(line)
+            buf_len += len(line)
+        if buf:
+            text = "".join(buf).strip()
+            if len(text) >= 60:
+                out.append({
+                    "id": f"session:{sid}:{idx}",
+                    "title": meta.get("title") or sid,
+                    "text": text,
+                    "meta": {"session_id": sid, "session_title": meta.get("title") or "", "source_type": meta.get("source") or "", "started_at": meta.get("started_at")},
+                })
+    # tag consumer on the way out
+    for c in out:
+        c["consumer"] = consumer
+    return out
+
+
+def _skills_chunks() -> list[dict]:
+    """Walk the mounted skills dir (symlinked from /root/.hermes/skills), chunk .md files."""
+    out: list[dict] = []
+    if not SKILLS_DIR.is_dir():
+        return out
+    for md in sorted(SKILLS_DIR.rglob("*.md")):
+        if ".archive" in md.parts:
+            continue
+        rel = str(md.relative_to(SKILLS_DIR))
+        try:
+            text = md.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        if len(text.strip()) < 80:
+            continue
+        for i, piece in enumerate(_split_markdown_para(text)):
+            out.append({
+                "id": f"skill:{rel}:{i}",
+                "title": rel,
+                "text": piece,
+                "meta": {"skill_path": rel, "chunk": i},
+            })
+    return out
+
+
+async def _refresh_sources():
+    """Rebuild skills + sessions from the mounted /sources dir (NFS)."""
+    results = {}
+
+    # skills — shared knowledge (consumer NULL)
+    skill_chunks = _skills_chunks()
+    if skill_chunks:
+        conn = _db()
+        conn.execute("DELETE FROM chunks WHERE source='skill'")
+        conn.commit()
+        conn.close()
+        texts = [c["text"] for c in skill_chunks]
+        vecs = await _embed_async(texts)
+        conn = _db()
+        now = time.time()
+        for c, v in zip(skill_chunks, vecs):
+            conn.execute(
+                "INSERT INTO chunks (id, source, consumer, title, text, meta, vec, updated_at) VALUES (?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET consumer=excluded.consumer, title=excluded.title, text=excluded.text, meta=excluded.meta, "
+                "vec=excluded.vec, updated_at=excluded.updated_at",
+                (c["id"], "skill", None, c["title"], c["text"], json.dumps(c["meta"]), _vec_to_blob(v), now),
+            )
+        conn.commit()
+        conn.close()
+        results["skill"] = len(skill_chunks)
+    else:
+        results["skill"] = "SKIP (no /sources/skills mount)"
+
+    # sessions — snapshot DB from NFS, tagged with SESSION_CONSUMER.
+    # Only the backfill chunks (id 'session:<sid>:<i>') are rebuilt here; live
+    # chunks (id 'live:<consumer>:<ts>', pushed by llm-gateway in real time)
+    # are preserved — they're the freshest session memory.
+    if SESSION_DB.is_file():
+        sess_chunks = _session_chunks(SESSION_DB, SESSION_CONSUMER)
+        if sess_chunks:
+            conn = _db()
+            conn.execute("DELETE FROM chunks WHERE source='session' AND id LIKE 'session:%'")
+            conn.commit()
+            conn.close()
+            texts = [c["text"] for c in sess_chunks]
+            vecs = await _embed_async(texts)
+            conn = _db()
+            now = time.time()
+            for c, v in zip(sess_chunks, vecs):
+                conn.execute(
+                    "INSERT INTO chunks (id, source, consumer, title, text, meta, vec, updated_at) VALUES (?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(id) DO UPDATE SET consumer=excluded.consumer, title=excluded.title, text=excluded.text, meta=excluded.meta, "
+                    "vec=excluded.vec, updated_at=excluded.updated_at",
+                    (c["id"], "session", c["consumer"], c["title"], c["text"], json.dumps(c["meta"]), _vec_to_blob(v), now),
+                )
+            conn.commit()
+            conn.close()
+            results["session"] = len(sess_chunks)
+    else:
+        results["session"] = "SKIP (no /sources/hermes-state.db mount)"
+
+    return {"status": "ok", **results}
+
+
 @app.post("/refresh")
 async def refresh(request: Request):
-    """Re-clone homelab-docs and rebuild the docs index. Sessions are pushed by the host exporter."""
+    """Re-clone homelab-docs and/or reindex from the mounted /sources dir.
+
+    Body flags: {"docs": true} rebuilds docs (git clone);
+    {"sources": true} rebuilds skills + sessions from the NFS mount (skills
+    symlink + hermes-state.db snapshot) — replaces the old host exporters.
+    """
     body = {}
     try:
         body = await request.json()
@@ -377,7 +558,9 @@ async def refresh(request: Request):
         pass
     if body.get("docs"):
         return await _refresh_docs()
-    return {"status": "ok", "hint": "use {\"docs\": true} to rebuild docs; sessions are pushed via /ingest/sessions"}
+    if body.get("sources"):
+        return await _refresh_sources()
+    return {"status": "ok", "hint": 'use {"docs": true} or {"sources": true}'}
 
 
 if __name__ == "__main__":
