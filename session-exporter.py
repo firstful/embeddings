@@ -21,7 +21,7 @@ STATE_DB = "/root/.hermes/state.db"
 LAST_ID_FILE = "/var/lib/embeddings-sync/last_msg_id"
 EMBEDDINGS_URL = os.environ.get("EMBEDDINGS_URL", "http://embeddings.homelab.internal")
 CHUNK_CHARS = 1500
-BATCH = 200  # chunks per POST
+BATCH = 50  # chunks per POST (smaller = lower pod memory per request)
 
 
 # NAT64/DNS64 gotcha: this host's resolver returns 64:ff9b:: IPv6 addrs FIRST

@@ -49,7 +49,14 @@ def get_model():
     global _model
     if _model is None:
         from fastembed import TextEmbedding
-        _model = TextEmbedding(model_name=MODEL_NAME, cache_dir=MODEL_CACHE)
+        # threads: cap to 2 — pod CPU limit is 2; onnxruntime's default pool
+        # spawns per-core threads (12+ on the Ryzen) and blew past the 2Gi
+        # memory limit during big ingests (OOMKilled 2026-08-06).
+        _model = TextEmbedding(
+            model_name=MODEL_NAME,
+            cache_dir=MODEL_CACHE,
+            threads=int(os.environ.get("ORT_THREADS", "2")),
+        )
     return _model
 
 
