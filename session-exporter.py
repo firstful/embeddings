@@ -11,6 +11,7 @@ pod itself never touches the Hermes DB — this exporter is the only bridge.
 
 import json
 import os
+import socket
 import sqlite3
 import sys
 import time
@@ -21,6 +22,21 @@ LAST_ID_FILE = "/var/lib/embeddings-sync/last_msg_id"
 EMBEDDINGS_URL = os.environ.get("EMBEDDINGS_URL", "http://embeddings.homelab.internal")
 CHUNK_CHARS = 1500
 BATCH = 200  # chunks per POST
+
+
+# NAT64/DNS64 gotcha: this host's resolver returns 64:ff9b:: IPv6 addrs FIRST
+# and Python urllib hangs on IPv6. Force IPv4 the same way curl -4 does.
+class _IPv4HTTPSConnection(urllib.request.HTTPConnection):
+    def connect(self):
+        self.sock = socket.create_connection((self.host, self.port), self.timeout, source_address=("0.0.0.0", 0))
+
+
+class _IPv4HTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_IPv4HTTPSConnection, req)
+
+
+_OPENER = urllib.request.build_opener(_IPv4HTTPHandler)
 
 def chunk_conversation(messages: list[dict]) -> list[dict]:
     """Group messages into rolling text windows; each becomes one chunk."""
@@ -125,7 +141,7 @@ def _post(chunks: list[dict], base_url: str):
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=120) as resp:
+    with _OPENER.open(req, timeout=180) as resp:
         data = json.loads(resp.read())
     if data.get("status") != "ok":
         raise RuntimeError(f"ingest failed: {data}")

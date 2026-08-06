@@ -22,6 +22,7 @@ import time
 import uuid
 from pathlib import Path
 
+import asyncio
 import numpy as np
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -78,6 +79,12 @@ def _embed(texts: list[str]) -> list[np.ndarray]:
     return out
 
 
+async def _embed_async(texts: list[str]) -> list[np.ndarray]:
+    """Embed off the event loop — onnxruntime is CPU-bound and would stall
+    /health during large ingests (kubelet liveness killed the pod)."""
+    return await asyncio.to_thread(_embed, texts)
+
+
 def _vec_to_blob(v: np.ndarray) -> bytes:
     return v.astype(np.float32).tobytes()
 
@@ -114,7 +121,7 @@ async def embeddings(request: Request):
         single = False
     else:
         return JSONResponse(status_code=400, content={"error": {"message": "input must be string or list"}})
-    vecs = _embed([t for t in texts if t.strip()])
+    vecs = await _embed_async([t for t in texts if t.strip()])
     # fastembed skips empty strings; re-align with an empty-vector placeholder
     full = []
     j = 0
@@ -142,7 +149,8 @@ async def ingest(request: Request):
     texts = [str(c.get("text", "")).strip() for c in chunks]
     if not any(texts):
         return JSONResponse(status_code=400, content={"error": {"message": "no non-empty chunk text"}})
-    vecs = _embed([t for t in texts if t])
+    vecs = await _embed_async([t for t in texts if t])
+
     conn = _db()
     now = time.time()
     n = 0
@@ -178,7 +186,7 @@ async def ingest_sessions(request: Request):
     texts = [str(c.get("text", "")).strip() for c in chunks]
     if not texts or not any(texts):
         return JSONResponse(status_code=400, content={"error": {"message": "no non-empty chunk text"}})
-    vecs = _embed([t for t in texts if t])
+    vecs = await _embed_async([t for t in texts if t])
     conn = _db()
     now = time.time()
     n = 0
@@ -215,7 +223,7 @@ async def search(request: Request):
     sources = body.get("sources")
     min_score = float(body.get("min_score", MIN_SCORE))
 
-    qv = _embed([query])[0]
+    qv = (await _embed_async([query]))[0]
     conn = _db()
     if sources:
         marks = ",".join("?" * len(sources))
@@ -297,7 +305,7 @@ def _docs_chunks() -> list[dict]:
         return chunks
 
 
-def _refresh_docs():
+async def _refresh_docs():
     chunks = _docs_chunks()
     if not chunks:
         return {"status": "error", "detail": "no docs chunks"}
@@ -307,7 +315,7 @@ def _refresh_docs():
     conn.close()
     # embed + insert
     texts = [c["text"] for c in chunks]
-    vecs = _embed(texts)
+    vecs = await _embed_async(texts)
     conn = _db()
     now = time.time()
     for c, v in zip(chunks, vecs):
@@ -331,7 +339,7 @@ async def refresh(request: Request):
     except Exception:
         pass
     if body.get("docs"):
-        return _refresh_docs()
+        return await _refresh_docs()
     return {"status": "ok", "hint": "use {\"docs\": true} to rebuild docs; sessions are pushed via /ingest/sessions"}
 
 
