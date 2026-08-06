@@ -40,7 +40,7 @@ MIN_SCORE = float(os.environ.get("MIN_SCORE", "0.15"))
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title=APP_NAME, version="1.0.0")
+app = FastAPI(title=APP_NAME, version="1.1.0")
 
 _model = None
 
@@ -66,6 +66,7 @@ def _db() -> sqlite3.Connection:
         """CREATE TABLE IF NOT EXISTS chunks (
             id TEXT PRIMARY KEY,
             source TEXT NOT NULL,
+            consumer TEXT,
             title TEXT,
             text TEXT NOT NULL,
             meta TEXT,
@@ -73,6 +74,11 @@ def _db() -> sqlite3.Connection:
             updated_at REAL NOT NULL
         )"""
     )
+    # migration: add consumer column if the table predates it
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(chunks)").fetchall()]
+    if "consumer" not in cols:
+        conn.execute("ALTER TABLE chunks ADD COLUMN consumer TEXT")
+        conn.commit()
     conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source)")
     conn.commit()
     return conn
@@ -144,12 +150,13 @@ async def embeddings(request: Request):
 
 @app.post("/ingest")
 async def ingest(request: Request):
-    """Upsert chunks. Body: {source, chunks:[{id?,title?,text,meta?}]}. id defaults to hash(text)."""
+    """Upsert chunks. Body: {source, consumer?, chunks:[{id?,title?,text,meta?}]}. id defaults to hash(text)."""
     try:
         body = await request.json()
     except Exception:
         return JSONResponse(status_code=400, content={"error": {"message": "invalid JSON"}})
     source = str(body.get("source", "")).strip()
+    consumer = str(body.get("consumer") or "").strip() or None  # None = shared/global
     chunks = body.get("chunks") or []
     if not source or not chunks:
         return JSONResponse(status_code=400, content={"error": {"message": "source and chunks required"}})
@@ -165,31 +172,30 @@ async def ingest(request: Request):
     for c, t in zip(chunks, texts):
         if not t:
             continue
-        cid = str(c.get("id") or uuid.uuid5(uuid.NAMESPACE_URL, f"{source}:{t}"))
+        cid = str(c.get("id") or uuid.uuid5(uuid.NAMESPACE_URL, f"{source}:{consumer or ''}:{t}"))
         meta = c.get("meta") or {}
         conn.execute(
-            "INSERT INTO chunks (id, source, title, text, meta, vec, updated_at) VALUES (?,?,?,?,?,?,?) "
-            "ON CONFLICT(id) DO UPDATE SET title=excluded.title, text=excluded.text, meta=excluded.meta, "
+            "INSERT INTO chunks (id, source, consumer, title, text, meta, vec, updated_at) VALUES (?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(id) DO UPDATE SET consumer=excluded.consumer, title=excluded.title, text=excluded.text, meta=excluded.meta, "
             "vec=excluded.vec, updated_at=excluded.updated_at",
-            (cid, source, str(c.get("title") or ""), t, json.dumps(meta), _vec_to_blob(vecs[j]), now),
+            (cid, source, consumer, str(c.get("title") or ""), t, json.dumps(meta), _vec_to_blob(vecs[j]), now),
         )
         n += 1
         j += 1
     conn.commit()
     conn.close()
-    return {"status": "ok", "source": source, "upserted": n}
+    return {"status": "ok", "source": source, "consumer": consumer, "upserted": n}
 
 
 @app.post("/ingest/sessions")
 async def ingest_sessions(request: Request):
-    """Sessions arrive pre-chunked from the host exporter: {chunks:[...]} with source forced to 'session'."""
+    """Sessions arrive pre-chunked from the host exporter: {consumer?, chunks:[...]}. Source forced to 'session'."""
     try:
         body = await request.json()
     except Exception:
         return JSONResponse(status_code=400, content={"error": {"message": "invalid JSON"}})
     chunks = body.get("chunks") or []
-    payload = {"source": "session", "chunks": chunks}
-    # reuse ingest logic
+    consumer = str(body.get("consumer") or "").strip() or None  # None = legacy/shared (should not happen post-v1.1)
     texts = [str(c.get("text", "")).strip() for c in chunks]
     if not texts or not any(texts):
         return JSONResponse(status_code=400, content={"error": {"message": "no non-empty chunk text"}})
@@ -201,24 +207,29 @@ async def ingest_sessions(request: Request):
     for c, t in zip(chunks, texts):
         if not t:
             continue
-        cid = str(c.get("id") or uuid.uuid5(uuid.NAMESPACE_URL, f"session:{t}"))
+        cid = str(c.get("id") or uuid.uuid5(uuid.NAMESPACE_URL, f"session:{consumer or ''}:{t}"))
         meta = c.get("meta") or {}
         conn.execute(
-            "INSERT INTO chunks (id, source, title, text, meta, vec, updated_at) VALUES (?,?,?,?,?,?,?) "
-            "ON CONFLICT(id) DO UPDATE SET title=excluded.title, text=excluded.text, meta=excluded.meta, "
+            "INSERT INTO chunks (id, source, consumer, title, text, meta, vec, updated_at) VALUES (?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(id) DO UPDATE SET consumer=excluded.consumer, title=excluded.title, text=excluded.text, meta=excluded.meta, "
             "vec=excluded.vec, updated_at=excluded.updated_at",
-            (cid, "session", str(c.get("title") or ""), t, json.dumps(meta), _vec_to_blob(vecs[j]), now),
+            (cid, "session", consumer, str(c.get("title") or ""), t, json.dumps(meta), _vec_to_blob(vecs[j]), now),
         )
         n += 1
         j += 1
     conn.commit()
     conn.close()
-    return {"status": "ok", "source": "session", "upserted": n}
+    return {"status": "ok", "source": "session", "consumer": consumer, "upserted": n}
 
 
 @app.post("/search")
 async def search(request: Request):
-    """Semantic search. Body: {query, top_k?, sources?[docs|session], min_score?} -> {results:[{id,source,title,text,meta,score}]}."""
+    """Semantic search. Body: {query, top_k?, sources?[docs|session], min_score?, consumers?: list[str]}.
+
+    Consumer scoping (v1.1): docs chunks are shared (consumer NULL); session chunks
+    belong to one consumer. Pass `consumers` to restrict session hits to those
+    consumers — docs always included. Omitting `consumers` is legacy behavior and
+    matches EVERYTHING (backward compat for pre-v1.1 callers)."""
     try:
         body = await request.json()
     except Exception:
@@ -229,24 +240,42 @@ async def search(request: Request):
     top_k = int(body.get("top_k", TOP_K_DEFAULT))
     sources = body.get("sources")
     min_score = float(body.get("min_score", MIN_SCORE))
+    consumers = body.get("consumers")
+    if consumers is not None and not isinstance(consumers, list):
+        consumers = [str(consumers)]
+    if consumers is not None:
+        consumers = [str(c).strip() for c in consumers if str(c).strip()]
 
     qv = (await _embed_async([query]))[0]
     conn = _db()
+
+    where = []
+    params: list = []
     if sources:
         marks = ",".join("?" * len(sources))
-        rows = conn.execute(
-            f"SELECT id, source, title, text, meta, vec FROM chunks WHERE source IN ({marks})", list(sources)
-        ).fetchall()
-    else:
-        rows = conn.execute("SELECT id, source, title, text, meta, vec FROM chunks").fetchall()
+        where.append(f"source IN ({marks})")
+        params.extend(sources)
+    if consumers is not None:
+        if consumers:
+            marks = ",".join("?" * len(consumers))
+            # docs (shared, consumer NULL) always visible; sessions scoped to listed consumers
+            where.append(f"(consumer IS NULL OR consumer IN ({marks}))")
+            params.extend(consumers)
+        else:
+            # empty consumer list -> shared chunks only (docs)
+            where.append("consumer IS NULL")
+    sql = "SELECT id, source, consumer, title, text, meta, vec FROM chunks"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    rows = conn.execute(sql, params).fetchall()
     conn.close()
 
     scored = []
-    for cid, source, title, text, meta, vblob in rows:
+    for cid, source, consumer, title, text, meta, vblob in rows:
         v = _blob_to_vec(vblob)
         s = _cosine(qv, v)
         if s >= min_score:
-            scored.append({"id": cid, "source": source, "title": title, "text": text, "meta": meta, "score": round(s, 4)})
+            scored.append({"id": cid, "source": source, "consumer": consumer, "title": title, "text": text, "meta": meta, "score": round(s, 4)})
     scored.sort(key=lambda x: x["score"], reverse=True)
     return {"query": query, "count": len(scored), "results": scored[:top_k]}
 
@@ -256,8 +285,9 @@ async def stats():
     conn = _db()
     total = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
     by_source = conn.execute("SELECT source, COUNT(*) FROM chunks GROUP BY source").fetchall()
+    by_consumer = conn.execute("SELECT COALESCE(consumer,'shared'), COUNT(*) FROM chunks GROUP BY consumer").fetchall()
     conn.close()
-    return {"total": total, "by_source": {s: c for s, c in by_source}}
+    return {"total": total, "by_source": {s: c for s, c in by_source}, "by_consumer": {s: c for s, c in by_consumer}}
 
 
 # ---------------- indexing ----------------
@@ -327,10 +357,10 @@ async def _refresh_docs():
     now = time.time()
     for c, v in zip(chunks, vecs):
         conn.execute(
-            "INSERT INTO chunks (id, source, title, text, meta, vec, updated_at) VALUES (?,?,?,?,?,?,?) "
-            "ON CONFLICT(id) DO UPDATE SET title=excluded.title, text=excluded.text, meta=excluded.meta, "
+            "INSERT INTO chunks (id, source, consumer, title, text, meta, vec, updated_at) VALUES (?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(id) DO UPDATE SET consumer=excluded.consumer, title=excluded.title, text=excluded.text, meta=excluded.meta, "
             "vec=excluded.vec, updated_at=excluded.updated_at",
-            (c["id"], "docs", c["title"], c["text"], json.dumps(c["meta"]), _vec_to_blob(v), now),
+            (c["id"], "docs", None, c["title"], c["text"], json.dumps(c["meta"]), _vec_to_blob(v), now),
         )
     conn.commit()
     conn.close()

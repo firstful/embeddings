@@ -16,17 +16,19 @@ import sqlite3
 import sys
 import time
 import urllib.request
+from http.client import HTTPConnection
 
 STATE_DB = "/root/.hermes/state.db"
 LAST_ID_FILE = "/var/lib/embeddings-sync/last_msg_id"
 EMBEDDINGS_URL = os.environ.get("EMBEDDINGS_URL", "http://embeddings.homelab.internal")
+CONSUMER = os.environ.get("CONSUMER", "hermes-rook")
 CHUNK_CHARS = 1500
 BATCH = 50  # chunks per POST (smaller = lower pod memory per request)
 
 
 # NAT64/DNS64 gotcha: this host's resolver returns 64:ff9b:: IPv6 addrs FIRST
 # and Python urllib hangs on IPv6. Force IPv4 the same way curl -4 does.
-class _IPv4HTTPSConnection(urllib.request.HTTPConnection):
+class _IPv4HTTPSConnection(HTTPConnection):
     def connect(self):
         self.sock = socket.create_connection((self.host, self.port), self.timeout, source_address=("0.0.0.0", 0))
 
@@ -138,7 +140,7 @@ def main():
 
 
 def _post(chunks: list[dict], base_url: str):
-    body = json.dumps({"chunks": chunks}).encode()
+    body = json.dumps({"consumer": CONSUMER, "chunks": chunks}).encode()
     req = urllib.request.Request(
         f"{base_url}/ingest/sessions",
         data=body,
