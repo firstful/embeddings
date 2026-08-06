@@ -121,6 +121,10 @@ def main():
             _post(pending, EMBEDDINGS_URL)
             total_chunks += len(pending)
             pending = []
+            # persist watermark after EVERY successful batch — an interrupted run
+            # (killed exporter) re-syncs only the tail, not all 30k messages.
+            with open(LAST_ID_FILE, "w") as f:
+                f.write(str(max_id))
 
     if pending:
         _post(pending, EMBEDDINGS_URL)
