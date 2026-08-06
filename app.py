@@ -36,7 +36,7 @@ DB_PATH = DATA_DIR / "vectors.db"
 DOCS_URL = os.environ.get("DOCS_URL", "http://192.168.1.2:3000/reeds/homelab-docs.git")
 DOCS_TOKEN = os.environ.get("DOCS_TOKEN", "")
 SOURCES_DIR = Path(os.environ.get("SOURCES_DIR", "/sources"))
-SKILLS_DIR = SOURCES_DIR / "skills"
+SKILLS_DIR = Path(os.environ.get("SKILLS_DIR", "/skills"))
 SESSION_DB = SOURCES_DIR / "hermes-state.db"
 SESSION_CONSUMER = os.environ.get("SESSION_CONSUMER", "hermes-rook")
 TOP_K_DEFAULT = int(os.environ.get("TOP_K_DEFAULT", "5"))
@@ -44,7 +44,7 @@ MIN_SCORE = float(os.environ.get("MIN_SCORE", "0.15"))
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title=APP_NAME, version="1.2.0")
+app = FastAPI(title=APP_NAME, version="1.2.1")
 
 _model = None
 
