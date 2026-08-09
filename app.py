@@ -44,7 +44,7 @@ MIN_SCORE = float(os.environ.get("MIN_SCORE", "0.15"))
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title=APP_NAME, version="1.2.3")
+app = FastAPI(title=APP_NAME, version="1.2.4")
 
 _model = None
 
@@ -396,10 +396,17 @@ def _split_markdown_para(text: str, min_chars: int = 150, max_chars: int = 1800)
 
 def _session_chunks(db_path: Path, consumer: str, chunk_chars: int = 1500) -> list[dict]:
     """Read the state.db snapshot and chunk conversations per session (same logic as
-    the old host exporter: role: content lines, ~1500-char windows)."""
+    the old host exporter: role: content lines, ~1500-char windows).
+
+    immutable=1: the snapshot is a static .backup copy served over a READ-ONLY
+    NFS mount. A WAL-mode DB (state.db is WAL) cannot be opened read-only — SQLite
+    must write the -shm lock file — so treat the file as immutable (no locking).
+    Without this, _refresh_sources dies with "unable to open database file"
+    (hit 2026-08-09, v1.2.3).
+    """
     import sqlite3 as _sq
 
-    conn = _sq.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = _sq.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True)
     conn.row_factory = _sq.Row
     sessions = {}
     try:
