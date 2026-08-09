@@ -44,7 +44,7 @@ MIN_SCORE = float(os.environ.get("MIN_SCORE", "0.15"))
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title=APP_NAME, version="1.2.4")
+app = FastAPI(title=APP_NAME, version="1.2.5")
 
 _model = None
 
@@ -569,7 +569,7 @@ async def _rebuild_source(source: str, chunks: list[dict], *, preserve_live: boo
             )
         conn.commit()
         n += len(batch)
-        await asyncio.sleep(0.05)  # let /health + probes breathe between batches
+        await asyncio.sleep(0.3)  # yield the event loop + let probes breathe (CPU-starved /health = liveness kill, hit 2026-08-09)
     conn.close()
     return n
 
