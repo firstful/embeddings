@@ -44,7 +44,7 @@ MIN_SCORE = float(os.environ.get("MIN_SCORE", "0.15"))
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title=APP_NAME, version="1.2.1")
+app = FastAPI(title=APP_NAME, version="1.2.2")
 
 _model = None
 
@@ -459,15 +459,55 @@ def _session_chunks(db_path: Path, consumer: str, chunk_chars: int = 1500) -> li
     return out
 
 
+def _bundled_skill_names() -> set[str]:
+    """Skill names that ship with Hermes, from .bundled_manifest (name:hash per line).
+
+    Hermes keeps a copy of every bundled skill in ~/.hermes/skills (mixed with
+    user skills); the manifest is the authoritative shipped-with-Hermes list.
+    """
+    out: set[str] = set()
+    try:
+        for line in (SKILLS_DIR / ".bundled_manifest").read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if ":" in line:
+                out.add(line.split(":", 1)[0])
+    except OSError:
+        pass
+    return out
+
+
+_BUNDLED_SKILLS = _bundled_skill_names()
+
+
+def _skill_name(rel: Path) -> str | None:
+    """Skill dir name for a repo-relative path: nearest ancestor holding SKILL.md."""
+    p = rel.parent
+    while str(p) not in (".", ""):
+        if (SKILLS_DIR / p / "SKILL.md").is_file():
+            return p.name
+        p = p.parent
+    return None
+
+
 def _skills_chunks() -> list[dict]:
-    """Walk the mounted skills dir (symlinked from /root/.hermes/skills), chunk .md files."""
+    """Walk the mounted skills dir, chunk .md files.
+
+    Reed 2026-08-09: ONLY custom skills go in the RAG corpus — skip anything in
+    .bundled_manifest (ships with Hermes) and all Hermes internal dot-dirs
+    (.archive, .curator_backups, .curator_state, .usage.json, ...).
+    """
     out: list[dict] = []
     if not SKILLS_DIR.is_dir():
         return out
     for md in sorted(SKILLS_DIR.rglob("*.md")):
-        if ".archive" in md.parts:
+        relp = md.relative_to(SKILLS_DIR)
+        if any(p.startswith(".") for p in relp.parts):
             continue
-        rel = str(md.relative_to(SKILLS_DIR))
+        name = _skill_name(relp)
+        if name is None or name in _BUNDLED_SKILLS:
+            # None = not part of any skill (category DESCRIPTION.md, stray files)
+            continue
+        rel = str(relp)
         try:
             text = md.read_text(encoding="utf-8", errors="replace")
         except Exception:

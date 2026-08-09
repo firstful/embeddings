@@ -64,15 +64,52 @@ def _split_markdown(text: str, min_chars: int = 150, max_chars: int = 1800) -> l
     return [c for c in chunks if len(c) >= 80]
 
 
+def _bundled_skill_names() -> set[str]:
+    """Skill names that ship with Hermes, from .bundled_manifest (name:hash per line)."""
+    out: set[str] = set()
+    try:
+        with open(os.path.join(SKILLS_ROOT, ".bundled_manifest"), encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if ":" in line:
+                    out.add(line.split(":", 1)[0])
+    except OSError:
+        pass
+    return out
+
+
+_BUNDLED_SKILLS = _bundled_skill_names()
+
+
+def _skill_name(relpath: str) -> str | None:
+    """Skill dir name for a repo-relative path: nearest ancestor holding SKILL.md."""
+    p = os.path.dirname(relpath)
+    while p and p != ".":
+        if os.path.isfile(os.path.join(SKILLS_ROOT, p, "SKILL.md")):
+            return os.path.basename(p)
+        p = os.path.dirname(p)
+    return None
+
+
 def _iter_md():
-    """Yield (relpath, text) for every .md under SKILLS_ROOT, skipping .archive."""
+    """Yield (relpath, text) for every .md under SKILLS_ROOT.
+
+    Reed 2026-08-09: custom skills ONLY — skip bundled skills (.bundled_manifest)
+    and Hermes internal dot-dirs (.archive, .curator_backups, ...).
+    NOTE: superseded as the active ingest path by the pod's /refresh
+    ({"sources": true}, 2h cadence) — kept for manual/legacy use.
+    """
     for root, dirs, files in os.walk(SKILLS_ROOT):
-        dirs[:] = [d for d in dirs if d != ".archive"]
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
         for f in sorted(files):
             if not f.endswith(".md"):
                 continue
             p = os.path.join(root, f)
             rel = os.path.relpath(p, SKILLS_ROOT)
+            name = _skill_name(rel)
+            if name is None or name in _BUNDLED_SKILLS:
+                # None = not part of any skill (category DESCRIPTION.md, stray files)
+                continue
             try:
                 text = open(p, encoding="utf-8", errors="replace").read()
             except OSError:
