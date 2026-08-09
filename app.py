@@ -44,7 +44,7 @@ MIN_SCORE = float(os.environ.get("MIN_SCORE", "0.15"))
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title=APP_NAME, version="1.2.2")
+app = FastAPI(title=APP_NAME, version="1.2.3")
 
 _model = None
 
@@ -524,6 +524,49 @@ def _skills_chunks() -> list[dict]:
     return out
 
 
+_REBUILD_BATCH = 250
+
+
+async def _rebuild_source(source: str, chunks: list[dict], *, preserve_live: bool = False) -> int:
+    """Delete a source's backfill chunks, then re-embed + insert in batches.
+
+    Batched (and yielding to the event loop between batches) so a huge rebuild
+    never starves /health: a single unbatched 13k-chunk embed blocked the loop
+    past the 5s liveness deadline and the kubelet killed the pod mid-refresh
+    (hit 2026-08-09, v1.2.2 — skills were left deleted). preserve_live keeps
+    live:* session chunks (only backfill 'session:%' ids are deleted).
+    """
+    if not chunks:
+        return 0
+    conn = _db()
+    if preserve_live:
+        conn.execute("DELETE FROM chunks WHERE source=? AND id LIKE ?", (source, f"{source}:%"))
+    else:
+        conn.execute("DELETE FROM chunks WHERE source=?", (source,))
+    conn.commit()
+    conn.close()
+
+    conn = _db()
+    now = time.time()
+    n = 0
+    for start in range(0, len(chunks), _REBUILD_BATCH):
+        batch = chunks[start:start + _REBUILD_BATCH]
+        vecs = await _embed_async([c["text"] for c in batch])
+        for c, v in zip(batch, vecs):
+            cid = c["id"]
+            conn.execute(
+                "INSERT INTO chunks (id, source, consumer, title, text, meta, vec, updated_at) VALUES (?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET consumer=excluded.consumer, title=excluded.title, text=excluded.text, meta=excluded.meta, "
+                "vec=excluded.vec, updated_at=excluded.updated_at",
+                (cid, source, c.get("consumer"), c.get("title") or "", c["text"], json.dumps(c.get("meta") or {}), _vec_to_blob(v), now),
+            )
+        conn.commit()
+        n += len(batch)
+        await asyncio.sleep(0.05)  # let /health + probes breathe between batches
+    conn.close()
+    return n
+
+
 async def _refresh_sources():
     """Rebuild skills + sessions from the mounted /sources dir (NFS)."""
     results = {}
@@ -531,24 +574,7 @@ async def _refresh_sources():
     # skills — shared knowledge (consumer NULL)
     skill_chunks = _skills_chunks()
     if skill_chunks:
-        conn = _db()
-        conn.execute("DELETE FROM chunks WHERE source='skill'")
-        conn.commit()
-        conn.close()
-        texts = [c["text"] for c in skill_chunks]
-        vecs = await _embed_async(texts)
-        conn = _db()
-        now = time.time()
-        for c, v in zip(skill_chunks, vecs):
-            conn.execute(
-                "INSERT INTO chunks (id, source, consumer, title, text, meta, vec, updated_at) VALUES (?,?,?,?,?,?,?,?) "
-                "ON CONFLICT(id) DO UPDATE SET consumer=excluded.consumer, title=excluded.title, text=excluded.text, meta=excluded.meta, "
-                "vec=excluded.vec, updated_at=excluded.updated_at",
-                (c["id"], "skill", None, c["title"], c["text"], json.dumps(c["meta"]), _vec_to_blob(v), now),
-            )
-        conn.commit()
-        conn.close()
-        results["skill"] = len(skill_chunks)
+        results["skill"] = await _rebuild_source("skill", skill_chunks)
     else:
         results["skill"] = "SKIP (no /sources/skills mount)"
 
@@ -559,24 +585,7 @@ async def _refresh_sources():
     if SESSION_DB.is_file():
         sess_chunks = _session_chunks(SESSION_DB, SESSION_CONSUMER)
         if sess_chunks:
-            conn = _db()
-            conn.execute("DELETE FROM chunks WHERE source='session' AND id LIKE 'session:%'")
-            conn.commit()
-            conn.close()
-            texts = [c["text"] for c in sess_chunks]
-            vecs = await _embed_async(texts)
-            conn = _db()
-            now = time.time()
-            for c, v in zip(sess_chunks, vecs):
-                conn.execute(
-                    "INSERT INTO chunks (id, source, consumer, title, text, meta, vec, updated_at) VALUES (?,?,?,?,?,?,?,?) "
-                    "ON CONFLICT(id) DO UPDATE SET consumer=excluded.consumer, title=excluded.title, text=excluded.text, meta=excluded.meta, "
-                    "vec=excluded.vec, updated_at=excluded.updated_at",
-                    (c["id"], "session", c["consumer"], c["title"], c["text"], json.dumps(c["meta"]), _vec_to_blob(v), now),
-                )
-            conn.commit()
-            conn.close()
-            results["session"] = len(sess_chunks)
+            results["session"] = await _rebuild_source("session", sess_chunks, preserve_live=True)
     else:
         results["session"] = "SKIP (no /sources/hermes-state.db mount)"
 
