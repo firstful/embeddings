@@ -44,7 +44,7 @@ MIN_SCORE = float(os.environ.get("MIN_SCORE", "0.15"))
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title=APP_NAME, version="1.2.5")
+app = FastAPI(title=APP_NAME, version="1.2.6")
 
 _model = None
 
@@ -578,8 +578,10 @@ async def _refresh_sources():
     """Rebuild skills + sessions from the mounted /sources dir (NFS)."""
     results = {}
 
-    # skills — shared knowledge (consumer NULL)
-    skill_chunks = _skills_chunks()
+    # skills — shared knowledge (consumer NULL).
+    # to_thread: _skills_chunks walks /skills over NFS; running it on the event
+    # loop starves /health (liveness kill, hit 2026-08-09 v1.2.5).
+    skill_chunks = await asyncio.to_thread(_skills_chunks)
     if skill_chunks:
         results["skill"] = await _rebuild_source("skill", skill_chunks)
     else:
@@ -589,8 +591,10 @@ async def _refresh_sources():
     # Only the backfill chunks (id 'session:<sid>:<i>') are rebuilt here; live
     # chunks (id 'live:<consumer>:<ts>', pushed by llm-gateway in real time)
     # are preserved — they're the freshest session memory.
+    # to_thread: _session_chunks scans the 400MB snapshot over NFS (minute-long
+    # blocking read on the loop = /health starved = liveness kill).
     if SESSION_DB.is_file():
-        sess_chunks = _session_chunks(SESSION_DB, SESSION_CONSUMER)
+        sess_chunks = await asyncio.to_thread(_session_chunks, SESSION_DB, SESSION_CONSUMER)
         if sess_chunks:
             results["session"] = await _rebuild_source("session", sess_chunks, preserve_live=True)
     else:
