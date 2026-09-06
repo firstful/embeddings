@@ -44,7 +44,14 @@ MIN_SCORE = float(os.environ.get("MIN_SCORE", "0.15"))
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title=APP_NAME, version="1.2.6")
+app = FastAPI(title=APP_NAME, version="1.2.7")
+
+# Serialize embedding calls: concurrent /ingest + /search requests all
+# trigger ONNX inference on separate threads. With 2 CPU + 2.5G RAM a
+# second in-flight embed can OOM the pod. Semaphore(1) queues callers
+# so only one batch embeds at a time; the event loop stays responsive
+# (health probes, DB writes are not blocked).
+_embed_sem = asyncio.Semaphore(1)
 
 _model = None
 
@@ -98,8 +105,11 @@ def _embed(texts: list[str]) -> list[np.ndarray]:
 
 async def _embed_async(texts: list[str]) -> list[np.ndarray]:
     """Embed off the event loop — onnxruntime is CPU-bound and would stall
-    /health during large ingests (kubelet liveness killed the pod)."""
-    return await asyncio.to_thread(_embed, texts)
+    /health during large ingests (kubelet liveness killed the pod).
+    Serialized via _embed_sem so concurrent requests queue instead of
+    all spinning up ONNX threads and OOM-ing the pod."""
+    async with _embed_sem:
+        return await asyncio.to_thread(_embed, texts)
 
 
 def _vec_to_blob(v: np.ndarray) -> bytes:
